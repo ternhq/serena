@@ -68,12 +68,10 @@ class TypeScriptLanguageServer(SolidLanguageServer):
     def _get_language_id_for_file(self, file_path: str) -> str:
         """
         Get the appropriate language ID for a given file path.
-        Vue files are treated as typescript since they contain TS in script blocks.
+        Vue files need 'vue' as language ID, others use 'typescript' or 'javascript'.
         """
         if file_path.endswith('.vue'):
-            # Use 'typescript' for Vue files to avoid language ID errors
-            # The Vue plugin will handle the Vue-specific parsing
-            return 'typescript'
+            return 'vue'
         elif file_path.endswith(('.js', '.jsx', '.mjs', '.cjs')):
             return 'javascript'
         else:  # .ts, .tsx, etc.
@@ -337,12 +335,20 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         }
 
         self.server.notify.initialized({})
-        if self.server_ready.wait(timeout=1.0):
+        
+        # Wait longer for server to be ready, especially important for Vue plugin initialization
+        if self.server_ready.wait(timeout=5.0):
             self.logger.log("TypeScript server is ready", logging.INFO)
         else:
             self.logger.log("Timeout waiting for TypeScript server to become ready, proceeding anyway", logging.INFO)
             # Fallback: assume server is ready after timeout
             self.server_ready.set()
+        
+        # Additional wait for Vue plugin to initialize
+        if vue_plugin_path:
+            self.logger.log("Waiting for Vue plugin to initialize...", logging.INFO)
+            sleep(2)
+            
         self.completions_available.set()
 
     @override
@@ -353,5 +359,6 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         #   one second helps. It may be that sleeping only once is enough but that's hard to reliably test.
         #   It may be that even this 1sec is not enough in larger TS projects, at some point we should find what
         #   causes this and solve it.
-        sleep(1)
+        # NOTE: Vue files need even more time to be properly indexed
+        sleep(3)
         return super()._send_references_request(relative_file_path, line, column)
