@@ -7,6 +7,7 @@ import os
 import pathlib
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import PurePath
 from time import sleep
@@ -64,6 +65,8 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         )
         self.server_ready = threading.Event()
         self.initialize_searcher_command_available = threading.Event()
+        self._is_quiescent = threading.Event()
+        self._last_quiescent_time = 0
     
     def _get_language_id_for_file(self, file_path: str) -> str:
         """
@@ -76,6 +79,27 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             return 'javascript'
         else:  # .ts, .tsx, etc.
             return 'typescript'
+    
+    def wait_for_quiescence(self, timeout: float = 10.0) -> bool:
+        """
+        Wait for the TypeScript server to become quiescent (idle).
+        This is important before making requests that depend on indexing being complete.
+        
+        :param timeout: Maximum time to wait in seconds
+        :return: True if server became quiescent, False if timeout
+        """
+        start_time = time.time()
+        
+        # First, clear the event to ensure we catch the next quiescent state
+        self._is_quiescent.clear()
+        
+        # Wait for quiescent state
+        if self._is_quiescent.wait(timeout=timeout):
+            self.logger.log(f"Server became quiescent after {time.time() - start_time:.2f}s", logging.DEBUG)
+            return True
+        else:
+            self.logger.log(f"Timeout waiting for server to become quiescent after {timeout}s", logging.WARNING)
+            return False
     
     @contextmanager
     def open_file(self, relative_file_path: str):
@@ -308,6 +332,11 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             if params.get("quiescent") == True:
                 self.server_ready.set()
                 self.completions_available.set()
+                self._is_quiescent.set()
+                self._last_quiescent_time = time.time()
+                self.logger.log("TypeScript server is quiescent", logging.DEBUG)
+            else:
+                self._is_quiescent.clear()
 
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_notification("window/logMessage", window_log_message)
@@ -336,7 +365,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
 
         self.server.notify.initialized({})
         
-        # Wait longer for server to be ready, especially important for Vue plugin initialization
+        # Wait for server to be ready
         if self.server_ready.wait(timeout=5.0):
             self.logger.log("TypeScript server is ready", logging.INFO)
         else:
@@ -344,21 +373,24 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             # Fallback: assume server is ready after timeout
             self.server_ready.set()
         
-        # Additional wait for Vue plugin to initialize
+        # Wait for initial quiescence instead of hard-coded delay
         if vue_plugin_path:
-            self.logger.log("Waiting for Vue plugin to initialize...", logging.INFO)
-            sleep(2)
+            self.logger.log("Waiting for Vue plugin initialization to complete...", logging.INFO)
+            self.wait_for_quiescence(timeout=10.0)
             
         self.completions_available.set()
 
     @override
-    # For some reason, the LS may need longer to process this, so we just retry
     def _send_references_request(self, relative_file_path: str, line: int, column: int):
-        # TODO: The LS doesn't return references contained in other files if it doesn't sleep. This is
-        #   despite the LS having processed requests already. I don't know what causes this, but sleeping
-        #   one second helps. It may be that sleeping only once is enough but that's hard to reliably test.
-        #   It may be that even this 1sec is not enough in larger TS projects, at some point we should find what
-        #   causes this and solve it.
-        # NOTE: Vue files need even more time to be properly indexed
-        sleep(3)
+        """
+        Send references request, but wait for server to be quiescent first.
+        The TypeScript server needs to finish indexing before it can return complete results.
+        """
+        # Wait for the server to finish processing
+        self.wait_for_quiescence(timeout=10.0)
+        
+        # Small additional delay to ensure all processing is complete
+        # (sometimes the server reports quiescent slightly before it's fully ready)
+        sleep(0.5)
+        
         return super()._send_references_request(relative_file_path, line, column)
