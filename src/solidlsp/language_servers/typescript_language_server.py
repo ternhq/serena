@@ -7,15 +7,19 @@ import os
 import pathlib
 import shutil
 import threading
+from contextlib import contextmanager
+from pathlib import PurePath
 from time import sleep
 
 from overrides import override
 from sensai.util.logging import LogTime
 
-from solidlsp.ls import SolidLanguageServer
+from solidlsp.ls import LSPFileBuffer, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
+from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.ls_logger import LanguageServerLogger
-from solidlsp.ls_utils import PlatformId, PlatformUtils
+from solidlsp.ls_utils import FileUtils, PlatformId, PlatformUtils
+from solidlsp.lsp_protocol_handler.lsp_constants import LSPConstants
 from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
@@ -60,6 +64,73 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         )
         self.server_ready = threading.Event()
         self.initialize_searcher_command_available = threading.Event()
+    
+    def _get_language_id_for_file(self, file_path: str) -> str:
+        """
+        Get the appropriate language ID for a given file path.
+        Vue files are treated as typescript since they contain TS in script blocks.
+        """
+        if file_path.endswith('.vue'):
+            # Use 'typescript' for Vue files to avoid language ID errors
+            # The Vue plugin will handle the Vue-specific parsing
+            return 'typescript'
+        elif file_path.endswith(('.js', '.jsx', '.mjs', '.cjs')):
+            return 'javascript'
+        else:  # .ts, .tsx, etc.
+            return 'typescript'
+    
+    @contextmanager
+    def open_file(self, relative_file_path: str):
+        """
+        Override open_file to use the correct language ID for Vue files.
+        """
+        if not self.server_started:
+            self.logger.log(
+                "open_file called before Language Server started",
+                logging.ERROR,
+            )
+            raise SolidLSPException("Language Server not started")
+
+        absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
+        uri = pathlib.Path(absolute_file_path).as_uri()
+
+        if uri in self.open_file_buffers:
+            assert self.open_file_buffers[uri].uri == uri
+            assert self.open_file_buffers[uri].ref_count >= 1
+
+            self.open_file_buffers[uri].ref_count += 1
+            yield self.open_file_buffers[uri]
+            self.open_file_buffers[uri].ref_count -= 1
+        else:
+            contents = FileUtils.read_file(self.logger, absolute_file_path)
+
+            version = 0
+            # Use the correct language ID based on file extension
+            language_id = self._get_language_id_for_file(relative_file_path)
+            self.open_file_buffers[uri] = LSPFileBuffer(uri, contents, version, language_id, 1)
+
+            self.server.notify.did_open_text_document(
+                {
+                    LSPConstants.TEXT_DOCUMENT: {
+                        LSPConstants.URI: uri,
+                        LSPConstants.LANGUAGE_ID: language_id,
+                        LSPConstants.VERSION: 0,
+                        LSPConstants.TEXT: contents,
+                    }
+                }
+            )
+            yield self.open_file_buffers[uri]
+            self.open_file_buffers[uri].ref_count -= 1
+
+        if uri in self.open_file_buffers and self.open_file_buffers[uri].ref_count == 0:
+            self.server.notify.did_close_text_document(
+                {
+                    LSPConstants.TEXT_DOCUMENT: {
+                        LSPConstants.URI: uri,
+                    }
+                }
+            )
+            del self.open_file_buffers[uri]
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
@@ -139,8 +210,33 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         Returns the initialize params for the TypeScript Language Server.
         """
         root_uri = pathlib.Path(repository_absolute_path).as_uri()
+        
+        # Check if @vue/typescript-plugin is available
+        vue_plugin_path = None
+        potential_paths = [
+            os.path.join(repository_absolute_path, "node_modules", "@vue", "typescript-plugin"),
+            os.path.join(repository_absolute_path, "..", "node_modules", "@vue", "typescript-plugin"),
+            os.path.join(os.path.dirname(repository_absolute_path), "node_modules", "@vue", "typescript-plugin"),
+        ]
+        
+        for path in potential_paths:
+            if os.path.exists(path):
+                vue_plugin_path = path
+                break
+        
+        initialization_options = {}
+        if vue_plugin_path:
+            initialization_options["plugins"] = [
+                {
+                    "name": "@vue/typescript-plugin",
+                    "location": vue_plugin_path,
+                    "languages": ["vue"]
+                }
+            ]
+        
         initialize_params = {
             "locale": "en",
+            "initializationOptions": initialization_options,
             "capabilities": {
                 "textDocument": {
                     "synchronization": {"didSave": True, "dynamicRegistration": True},
