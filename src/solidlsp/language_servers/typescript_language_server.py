@@ -15,15 +15,21 @@ from time import sleep
 from overrides import override
 from sensai.util.logging import LogTime
 
-from solidlsp.ls import LSPFileBuffer, SolidLanguageServer
+from solidlsp.ls import LSPFileBuffer, ReferenceInSymbol, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.ls_logger import LanguageServerLogger
+from solidlsp.ls_types import Location as LSLocation
 from solidlsp.ls_utils import FileUtils, PlatformId, PlatformUtils
 from solidlsp.lsp_protocol_handler.lsp_constants import LSPConstants
 from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
+
+
+class ServerIndexingException(SolidLSPException):
+    """Raised when the language server is still indexing and results would be incomplete."""
+    pass
 
 from .common import RuntimeDependency, RuntimeDependencyCollection
 
@@ -67,6 +73,9 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         self.initialize_searcher_command_available = threading.Event()
         self._is_quiescent = threading.Event()
         self._last_quiescent_time = 0
+        self._vue_plugin_path = None
+        self._initial_indexing_complete = False
+        self._initial_indexing_start_time = None
     
     def _get_language_id_for_file(self, file_path: str) -> str:
         """
@@ -226,8 +235,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             )
         return [tsserver_executable_path, "--stdio"]
 
-    @staticmethod
-    def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
+    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
         """
         Returns the initialize params for the TypeScript Language Server.
         """
@@ -235,16 +243,39 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         
         # Check if @vue/typescript-plugin is available
         vue_plugin_path = None
+        
+        # Look for Vue plugin in common locations
         potential_paths = [
+            # Direct node_modules
             os.path.join(repository_absolute_path, "node_modules", "@vue", "typescript-plugin"),
+            # Frontend subdirectory (common in monorepos)
+            os.path.join(repository_absolute_path, "frontend", "node_modules", "@vue", "typescript-plugin"),
+            # Parent directory
             os.path.join(repository_absolute_path, "..", "node_modules", "@vue", "typescript-plugin"),
             os.path.join(os.path.dirname(repository_absolute_path), "node_modules", "@vue", "typescript-plugin"),
         ]
         
+        # If we detect this might be a subdirectory of a larger project, check parent paths
+        if "frontend" in repository_absolute_path:
+            # Extract the frontend directory path
+            parts = repository_absolute_path.split(os.sep)
+            for i, part in enumerate(parts):
+                if part == "frontend":
+                    frontend_dir = os.sep.join(parts[:i+1])
+                    potential_paths.append(os.path.join(frontend_dir, "node_modules", "@vue", "typescript-plugin"))
+                    break
+        
+        self.logger.log(f"Looking for Vue plugin in: {potential_paths}", logging.DEBUG)
+        
         for path in potential_paths:
             if os.path.exists(path):
-                vue_plugin_path = path
+                vue_plugin_path = os.path.abspath(path)  # Use absolute path
+                self._vue_plugin_path = vue_plugin_path
+                self.logger.log(f"Found Vue TypeScript plugin at: {vue_plugin_path}", logging.INFO)
                 break
+        
+        if not vue_plugin_path:
+            self.logger.log(f"Vue TypeScript plugin not found in any of: {potential_paths}", logging.WARNING)
         
         initialization_options = {}
         if vue_plugin_path:
@@ -329,6 +360,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             """
             Also listen for experimental/serverStatus as a backup signal
             """
+            self.logger.log(f"Received experimental/serverStatus: {params}", logging.DEBUG)
             if params.get("quiescent") == True:
                 self.server_ready.set()
                 self.completions_available.set()
@@ -344,6 +376,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         self.server.on_notification("$/progress", do_nothing)
         self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
         self.server.on_notification("experimental/serverStatus", check_experimental_status)
+        self.server.on_notification("$/typescriptVersion", lambda params: self.logger.log(f"TypeScript version: {params}", logging.INFO))
 
         self.logger.log("Starting TypeScript server process", logging.INFO)
         self.server.start()
@@ -365,32 +398,177 @@ class TypeScriptLanguageServer(SolidLanguageServer):
 
         self.server.notify.initialized({})
         
-        # Wait for server to be ready
-        if self.server_ready.wait(timeout=5.0):
-            self.logger.log("TypeScript server is ready", logging.INFO)
-        else:
-            self.logger.log("Timeout waiting for TypeScript server to become ready, proceeding anyway", logging.INFO)
-            # Fallback: assume server is ready after timeout
-            self.server_ready.set()
-        
-        # Wait for initial quiescence instead of hard-coded delay
-        if vue_plugin_path:
-            self.logger.log("Waiting for Vue plugin initialization to complete...", logging.INFO)
-            self.wait_for_quiescence(timeout=10.0)
-            
+        # For TypeScript server, mark as ready immediately after initialized
+        # The server should be ready to handle requests at this point
+        self.server_ready.set()
         self.completions_available.set()
+        self.logger.log("TypeScript server marked as ready after initialization", logging.INFO)
+        
+        # Track initial indexing time
+        self._initial_indexing_start_time = time.time()
+        
+        # If Vue plugin is configured, give it a moment to initialize
+        # The working test shows 2 seconds is sufficient
+        if self._vue_plugin_path:
+            self.logger.log(f"Vue plugin configured at {self._vue_plugin_path}, waiting for initialization...", logging.INFO)
+            sleep(2.0)
+            self.logger.log("Vue plugin initialization wait complete", logging.INFO)
+            # For Vue projects, consider initial indexing complete after the wait
+            self._initial_indexing_complete = True
+        else:
+            self.logger.log("No Vue plugin found, proceeding without Vue support", logging.WARNING)
+            # For non-Vue projects, consider indexing complete immediately
+            self._initial_indexing_complete = True
 
+    def is_indexing_complete(self) -> bool:
+        """
+        Check if the TypeScript server has completed initial indexing.
+        For Vue projects, we need to ensure files are opened and indexed.
+        """
+        if not self._initial_indexing_complete:
+            return False
+            
+        # For Vue projects, check if we've waited long enough
+        if self._vue_plugin_path and self._initial_indexing_start_time:
+            elapsed = time.time() - self._initial_indexing_start_time
+            # Give at least 3 seconds for Vue plugin indexing
+            if elapsed < 3.0:
+                return False
+                
+        return True
+    
+    @override
+    def request_references(self, relative_file_path: str, line: int, column: int) -> list[LSLocation]:
+        """
+        Override request_references to handle Vue files properly.
+        For Vue projects, we need to open relevant Vue files before searching for references.
+        """
+        # Check if indexing is complete
+        if not self.is_indexing_complete():
+            self.logger.log("TypeScript server is still indexing, references may be incomplete", logging.WARNING)
+            raise ServerIndexingException(
+                "TypeScript language server is still indexing. Please wait a moment and try again."
+            )
+        
+        if not self._vue_plugin_path:
+            # No Vue plugin, use standard behavior
+            return super().request_references(relative_file_path, line, column)
+        
+        # For Vue projects, we need special handling
+        self.logger.log("Vue project detected, using enhanced reference search", logging.DEBUG)
+        
+        if not self.server_started:
+            self.logger.log("request_references called before Language Server started", logging.ERROR)
+            raise SolidLSPException("Language Server not started")
+        
+        # Open the source file first
+        with self.open_file(relative_file_path):
+            # For Vue projects, also open some Vue files to help the server find references
+            # This mimics what the working test does
+            vue_files_to_check = []
+            
+            # Find Vue files in the same directory and common locations
+            import glob
+            repo_path = self.repository_root_path
+            patterns = [
+                "src/*.vue",
+                "src/components/*.vue", 
+                "src/views/*.vue",
+                "*.vue"
+            ]
+            
+            for pattern in patterns:
+                full_pattern = os.path.join(repo_path, pattern)
+                for vue_file in glob.glob(full_pattern):
+                    rel_path = os.path.relpath(vue_file, repo_path)
+                    if not self.is_ignored_path(rel_path):
+                        vue_files_to_check.append(rel_path)
+            
+            # Limit to first 10 Vue files to avoid opening too many
+            vue_files_to_check = vue_files_to_check[:10]
+            
+            # Open Vue files
+            vue_contexts = []
+            for vue_file in vue_files_to_check:
+                try:
+                    ctx = self.open_file(vue_file)
+                    vue_contexts.append((vue_file, ctx))
+                    ctx.__enter__()
+                    self.logger.log(f"Opened Vue file: {vue_file}", logging.DEBUG)
+                except Exception as e:
+                    self.logger.log(f"Failed to open Vue file {vue_file}: {e}", logging.DEBUG)
+            
+            # Wait for indexing
+            if not self.wait_for_quiescence(timeout=10.0):
+                self.logger.log("Server not quiescent, proceeding anyway", logging.WARNING)
+            
+            # Give time for Vue plugin to process files
+            sleep(2.0)
+            
+            try:
+                # Now request references
+                response = self._send_references_request(relative_file_path, line=line, column=column)
+                
+                # Convert response to expected format
+                if response:
+                    locations = []
+                    for location in response:
+                        uri = location.get("uri", "")
+                        file_path = uri.replace("file://", "")
+                        
+                        # Convert to relative path
+                        if file_path.startswith(self.repository_root_path):
+                            relative_path = os.path.relpath(file_path, self.repository_root_path)
+                        else:
+                            relative_path = file_path
+                        
+                        # Filter out ignored paths
+                        if not self.is_ignored_path(relative_path):
+                            locations.append(LSLocation(
+                                uri=uri,
+                                range=location.get("range", {}),
+                                absolutePath=file_path,
+                                relativePath=relative_path
+                            ))
+                    
+                    return locations
+                else:
+                    return []
+                    
+            finally:
+                # Close Vue files
+                for vue_file, ctx in vue_contexts:
+                    try:
+                        ctx.__exit__(None, None, None)
+                    except Exception as e:
+                        self.logger.log(f"Error closing Vue file {vue_file}: {e}", logging.DEBUG)
+    
+    @override
+    def request_referencing_symbols(
+        self,
+        relative_file_path: str,
+        line: int,
+        column: int,
+        include_imports: bool = True,
+        include_self: bool = False,
+        include_body: bool = False,
+        include_file_symbols: bool = False,
+    ) -> list[ReferenceInSymbol]:
+        """Override to check if server is ready before making request."""
+        if not self.is_indexing_complete():
+            self.logger.log("TypeScript server is still indexing, references may be incomplete", logging.WARNING)
+            raise ServerIndexingException(
+                "TypeScript language server is still indexing. Please wait a moment and try again."
+            )
+        return super().request_referencing_symbols(
+            relative_file_path, line, column, include_imports, include_self, include_body, include_file_symbols
+        )
+    
     @override
     def _send_references_request(self, relative_file_path: str, line: int, column: int):
         """
         Send references request, but wait for server to be quiescent first.
         The TypeScript server needs to finish indexing before it can return complete results.
         """
-        # Wait for the server to finish processing
-        self.wait_for_quiescence(timeout=10.0)
-        
-        # Small additional delay to ensure all processing is complete
-        # (sometimes the server reports quiescent slightly before it's fully ready)
-        sleep(0.5)
-        
+        # Base implementation without extra waits since we handle that in request_references
         return super()._send_references_request(relative_file_path, line, column)
