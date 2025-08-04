@@ -76,6 +76,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         self._vue_plugin_path = None
         self._initial_indexing_complete = False
         self._initial_indexing_start_time = None
+        self._opened_vue_files = set()  # Track which Vue files we've already opened
     
     def _get_language_id_for_file(self, file_path: str) -> str:
         """
@@ -89,12 +90,12 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         else:  # .ts, .tsx, etc.
             return 'typescript'
     
-    def wait_for_quiescence(self, timeout: float = 10.0) -> bool:
+    def wait_for_quiescence(self, timeout: float = 60.0) -> bool:
         """
         Wait for the TypeScript server to become quiescent (idle).
         This is important before making requests that depend on indexing being complete.
         
-        :param timeout: Maximum time to wait in seconds
+        :param timeout: Maximum time to wait in seconds (increased to 60s for large projects)
         :return: True if server became quiescent, False if timeout
         """
         start_time = time.time()
@@ -107,7 +108,11 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             self.logger.log(f"Server became quiescent after {time.time() - start_time:.2f}s", logging.DEBUG)
             return True
         else:
-            self.logger.log(f"Timeout waiting for server to become quiescent after {timeout}s", logging.WARNING)
+            # For Vue projects, timeout is expected since TypeScript server doesn't send quiescence notifications
+            if self._vue_plugin_path:
+                self.logger.log(f"Quiescence timeout after {timeout}s (expected for Vue projects)", logging.DEBUG)
+            else:
+                self.logger.log(f"Timeout waiting for server to become quiescent after {timeout}s", logging.WARNING)
             return False
     
     @contextmanager
@@ -235,6 +240,12 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             )
         return [tsserver_executable_path, "--stdio"]
 
+    def _should_suppress_vue_warnings(self, file_path: str) -> bool:
+        """
+        Check if we should suppress certain warnings for Vue files.
+        """
+        return self._vue_plugin_path is not None and file_path.endswith('.vue')
+    
     def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
         """
         Returns the initialize params for the TypeScript Language Server.
@@ -275,7 +286,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
                 break
         
         if not vue_plugin_path:
-            self.logger.log(f"Vue TypeScript plugin not found in any of: {potential_paths}", logging.WARNING)
+            self.logger.log(f"Vue TypeScript plugin not found. Vue file support will be limited.", logging.INFO)
         
         initialization_options = {}
         if vue_plugin_path:
@@ -407,16 +418,26 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         # Track initial indexing time
         self._initial_indexing_start_time = time.time()
         
-        # If Vue plugin is configured, give it a moment to initialize
-        # The working test shows 2 seconds is sufficient
+        # If Vue plugin is configured, give it MORE time to initialize
+        # But poll for quiescence instead of fixed wait!
         if self._vue_plugin_path:
-            self.logger.log(f"Vue plugin configured at {self._vue_plugin_path}, waiting for initialization...", logging.INFO)
-            sleep(2.0)
-            self.logger.log("Vue plugin initialization wait complete", logging.INFO)
+            if self._is_quiescent.is_set():
+                self.logger.log(f"Vue plugin detected, but server already quiescent - skipping initialization wait", logging.INFO)
+            else:
+                self.logger.log(f"Vue plugin detected, polling for initialization (max 5s)...", logging.INFO)
+                # Poll instead of fixed wait
+                start_time = time.time()
+                while time.time() - start_time < 5.0:
+                    if self._is_quiescent.is_set():
+                        elapsed = time.time() - start_time
+                        self.logger.log(f"Vue plugin initialized after {elapsed:.1f}s", logging.INFO)
+                        break
+                    sleep(0.1)
+            
+            self.logger.log("Vue plugin initialization complete", logging.DEBUG)
             # For Vue projects, consider initial indexing complete after the wait
             self._initial_indexing_complete = True
         else:
-            self.logger.log("No Vue plugin found, proceeding without Vue support", logging.WARNING)
             # For non-Vue projects, consider indexing complete immediately
             self._initial_indexing_complete = True
 
@@ -429,10 +450,11 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             return False
             
         # For Vue projects, check if we've waited long enough
-        if self._vue_plugin_path and self._initial_indexing_start_time:
+        # But if server is already quiescent, we're good to go!
+        if self._vue_plugin_path and self._initial_indexing_start_time and not self._is_quiescent.is_set():
             elapsed = time.time() - self._initial_indexing_start_time
-            # Give at least 3 seconds for Vue plugin indexing
-            if elapsed < 3.0:
+            # NO LIMITS! Give at least 10 seconds for Vue plugin indexing
+            if elapsed < 10.0:
                 return False
                 
         return True
@@ -445,7 +467,6 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         """
         # Check if indexing is complete
         if not self.is_indexing_complete():
-            self.logger.log("TypeScript server is still indexing, references may be incomplete", logging.WARNING)
             raise ServerIndexingException(
                 "TypeScript language server is still indexing. Please wait a moment and try again."
             )
@@ -454,8 +475,9 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             # No Vue plugin, use standard behavior
             return super().request_references(relative_file_path, line, column)
         
-        # For Vue projects, we need special handling
-        self.logger.log("Vue project detected, using enhanced reference search", logging.DEBUG)
+        # For Vue projects, we need special handling to open Vue files
+        self.logger.log("Searching for references in Vue project...", logging.DEBUG)
+        self.logger.log("Note: 'Could not find containing symbol' warnings for .vue files are expected and can be ignored", logging.INFO)
         
         if not self.server_started:
             self.logger.log("request_references called before Language Server started", logging.ERROR)
@@ -467,43 +489,99 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             # This mimics what the working test does
             vue_files_to_check = []
             
-            # Find Vue files in the same directory and common locations
+            # Find Vue files, prioritizing those near the target file
             import glob
             repo_path = self.repository_root_path
-            patterns = [
-                "src/*.vue",
-                "src/components/*.vue", 
-                "src/views/*.vue",
-                "*.vue"
-            ]
             
-            for pattern in patterns:
-                full_pattern = os.path.join(repo_path, pattern)
-                for vue_file in glob.glob(full_pattern):
-                    rel_path = os.path.relpath(vue_file, repo_path)
-                    if not self.is_ignored_path(rel_path):
-                        vue_files_to_check.append(rel_path)
+            # Get the directory of the target file
+            target_dir = os.path.dirname(relative_file_path)
+            target_parts = target_dir.split(os.sep)
             
-            # Limit to first 10 Vue files to avoid opening too many
-            vue_files_to_check = vue_files_to_check[:10]
+            # For store files, we want to focus on the module they belong to
+            # e.g., for 'frontend/authorizations/src/store.ts', focus on 'frontend/authorizations'
+            if 'store' in os.path.basename(relative_file_path).lower() and len(target_parts) > 2:
+                # Go up to the module level (e.g., 'frontend/authorizations')
+                module_dir = os.sep.join(target_parts[:2])
+                self.logger.log(f"Store file detected, focusing on module: {module_dir}", logging.DEBUG)
+            else:
+                module_dir = target_dir
             
-            # Open Vue files
+            # Collect Vue files with priority
+            vue_files_by_priority = {
+                1: [],  # Same directory
+                2: [],  # Within module
+                3: [],  # Sibling modules
+                4: []   # Other files
+            }
+            
+            for root, dirs, files in os.walk(repo_path):
+                # Skip ignored directories
+                dirs[:] = [d for d in dirs if not self.is_ignored_dirname(d)]
+                
+                for file in files:
+                    if file.endswith('.vue'):
+                        full_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(full_path, repo_path)
+                        if not self.is_ignored_path(rel_path):
+                            # Determine priority
+                            file_dir = os.path.dirname(rel_path)
+                            if file_dir == target_dir:
+                                vue_files_by_priority[1].append(rel_path)
+                            elif rel_path.startswith(module_dir + os.sep):
+                                # File is within the same module
+                                vue_files_by_priority[2].append(rel_path)
+                            elif len(target_parts) > 1 and rel_path.startswith(target_parts[0] + os.sep):
+                                # File is in a sibling module (same parent)
+                                vue_files_by_priority[3].append(rel_path)
+                            else:
+                                vue_files_by_priority[4].append(rel_path)
+            
+            # Combine files by priority
+            vue_files_to_check = []
+            for priority in sorted(vue_files_by_priority.keys()):
+                vue_files_to_check.extend(vue_files_by_priority[priority])
+            
+            # NO LIMITS! Let's see what happens
+            self.logger.log(f"Found {len(vue_files_to_check)} Vue files, opening ALL of them (no limits!)", logging.WARNING)
+            
+            # Open Vue files - but skip ones we've already opened
             vue_contexts = []
-            for vue_file in vue_files_to_check:
+            files_to_open = [f for f in vue_files_to_check if f not in self._opened_vue_files]
+            already_opened = len(vue_files_to_check) - len(files_to_open)
+            
+            if already_opened > 0:
+                self.logger.log(f"Skipping {already_opened} Vue files already opened, opening {len(files_to_open)} new files", logging.INFO)
+            else:
+                self.logger.log(f"Opening {len(files_to_open)} Vue files for reference search", logging.INFO)
+                
+            for vue_file in files_to_open:
                 try:
                     ctx = self.open_file(vue_file)
                     vue_contexts.append((vue_file, ctx))
                     ctx.__enter__()
-                    self.logger.log(f"Opened Vue file: {vue_file}", logging.DEBUG)
+                    self._opened_vue_files.add(vue_file)
                 except Exception as e:
                     self.logger.log(f"Failed to open Vue file {vue_file}: {e}", logging.DEBUG)
             
-            # Wait for indexing
-            if not self.wait_for_quiescence(timeout=10.0):
-                self.logger.log("Server not quiescent, proceeding anyway", logging.WARNING)
+            # Wait for indexing - use dynamic timeout based on file count
+            dynamic_timeout = min(5.0 + len(vue_contexts) * 0.05, 120.0)  # 5s base + 50ms per file, cap at 2 minutes
+            self.logger.log(f"Waiting for quiescence with {dynamic_timeout:.1f}s timeout...", logging.DEBUG)
+            if not self.wait_for_quiescence(timeout=dynamic_timeout):
+                # For Vue projects, this is expected since TypeScript server doesn't send quiescence notifications
+                if self._vue_plugin_path:
+                    self.logger.log("Continuing without quiescence notification (expected for Vue projects)", logging.DEBUG)
+                else:
+                    self.logger.log("Server not quiescent, proceeding anyway", logging.WARNING)
             
-            # Give time for Vue plugin to process files
-            sleep(2.0)
+            # Check if we actually need to wait - if server is already quiescent, skip the wait
+            if self._is_quiescent.is_set():
+                self.logger.log(f"Server already quiescent, skipping wait for {len(vue_contexts)} Vue files", logging.INFO)
+            else:
+                # Give time for Vue plugin to process files
+                # More files = more time needed, NO CAP!
+                wait_time = 2.0 + len(vue_contexts) * 0.05  # Base 2s + 50ms per file, no cap
+                self.logger.log(f"Waiting {wait_time:.1f}s for Vue plugin to process {len(vue_contexts)} files (no cap!)", logging.WARNING)
+                sleep(wait_time)
             
             try:
                 # Now request references
@@ -531,8 +609,12 @@ class TypeScriptLanguageServer(SolidLanguageServer):
                                 relativePath=relative_path
                             ))
                     
+                    unique_files = set(loc['relativePath'] for loc in locations if loc['relativePath'])
+                    vue_refs = sum(1 for f in unique_files if f.endswith('.vue'))
+                    self.logger.log(f"Found {len(locations)} references across {len(unique_files)} files ({vue_refs} Vue files)", logging.INFO)
                     return locations
                 else:
+                    self.logger.log("No references found", logging.INFO)
                     return []
                     
             finally:
