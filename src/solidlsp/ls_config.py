@@ -80,6 +80,8 @@ class Language(str, Enum):
                     for postfix in ["x", ""]:
                         for base_pattern in ["ts", "js"]:
                             path_patterns.append(f"*.{prefix}{base_pattern}{postfix}")
+                # Add Vue file support
+                path_patterns.append("*.vue")
                 return FilenameMatcher(*path_patterns)
             case self.CSHARP | self.CSHARP_OMNISHARP:
                 return FilenameMatcher("*.cs")
